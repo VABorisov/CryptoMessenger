@@ -1,7 +1,7 @@
 package block
 
 type BlockCipher interface {
-	Encrypt()
-	Decrypt()
-	GetKey()
+	Encrypt(data []byte) ([]byte, error)
+	Decrypt(cipher []byte) ([]byte, error)
+	GetKey() []byte
 }
