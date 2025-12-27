@@ -1,0 +1,19 @@
+{
+  "files.encoding": "utf8",
+  "files.eol": "\n",
+  "files.insertFinalNewline": true,
+  "files.trimFinalNewlines": true,
+  "files.trimTrailingWhitespace": true,
+  "files.exclude": {},
+  "search.exclude": {},
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+  "[markdown]": {
+    "files.trimTrailingWhitespace": false
+  },
+  "[go]": {
+    "editor.tabSize": 4,
+    "editor.insertSpaces": false
+  },
+  "go.testEnvFile": "${workspaceFolder}/.env"
+}
