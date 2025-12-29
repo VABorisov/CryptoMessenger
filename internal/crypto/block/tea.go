@@ -1,6 +1,7 @@
 package block
 
 import (
+	"bytes"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -20,52 +21,60 @@ func NewTEABlockCipher(logger *slog.Logger) BlockCipher {
 	return c
 }
 
+func NewTEABlockCipherWithKey(logger *slog.Logger, key []byte) BlockCipher {
+	c := &TEABlockCipher{
+		logger: logger,
+	}
+	copy(c.key[:], key)
+	return c
+}
+
 func (c *TEABlockCipher) Encrypt(data []byte) ([]byte, error) {
 	c.logger.Info("encrypting data with TEA key")
-	if len(data)%8 != 0 {
-		err := errors.New("data length must be multiple of 8 bytes")
-		c.logger.Error("failed to encrypt data with TEA key", "error", err)
-		return nil, fmt.Errorf("TEA data encryption error: %w", err)
-	}
 
-	out := make([]byte, len(data))
+	// Добавляем padding
+	padded := addPKCS7Padding(data, 8)
 
-	for i := 0; i < len(data); i += 8 {
-		v0 := bytesToUint32(data[i : i+4])
-		v1 := bytesToUint32(data[i+4 : i+8])
-
+	out := make([]byte, len(padded))
+	for i := 0; i < len(padded); i += 8 {
+		v0 := bytesToUint32(padded[i : i+4])
+		v1 := bytesToUint32(padded[i+4 : i+8])
 		e0, e1 := teaEncryptBlock(v0, v1, c.key)
 		copy(out[i:i+4], uint32ToBytes(e0))
 		copy(out[i+4:i+8], uint32ToBytes(e1))
 	}
 
 	c.logger.Info("data successfully encrypted with TEA")
-
 	return out, nil
 }
 
 func (c *TEABlockCipher) Decrypt(cipher []byte) ([]byte, error) {
 	c.logger.Info("decrypting data with TEA key")
+
 	if len(cipher)%8 != 0 {
 		err := errors.New("ciphertext length must be multiple of 8 bytes")
-		c.logger.Error("failed to encrypt data with TEA key", "error", err)
-		return nil, fmt.Errorf("TEA data encryption error: %w", err)
+		c.logger.Error("failed to decrypt data with TEA key", "error", err)
+		return nil, fmt.Errorf("TEA data decryption error: %w", err)
 	}
 
 	out := make([]byte, len(cipher))
-
 	for i := 0; i < len(cipher); i += 8 {
 		v0 := bytesToUint32(cipher[i : i+4])
 		v1 := bytesToUint32(cipher[i+4 : i+8])
-
 		d0, d1 := teaDecryptBlock(v0, v1, c.key)
 		copy(out[i:i+4], uint32ToBytes(d0))
 		copy(out[i+4:i+8], uint32ToBytes(d1))
 	}
 
-	c.logger.Info("data successfully decrypted with TEA")
+	// Убираем padding
+	plaintext, err := removePKCS7Padding(out)
+	if err != nil {
+		c.logger.Error("invalid padding during TEA decryption", "error", err)
+		return nil, fmt.Errorf("TEA padding error: %w", err)
+	}
 
-	return out, nil
+	c.logger.Info("data successfully decrypted with TEA")
+	return plaintext, nil
 }
 
 func (c *TEABlockCipher) GetKey() []byte {
@@ -129,4 +138,26 @@ func teaDecryptBlock(v0, v1 uint32, key [16]byte) (uint32, uint32) {
 		sum -= d
 	}
 	return v0, v1
+}
+
+func addPKCS7Padding(data []byte, blockSize int) []byte {
+	padding := blockSize - (len(data) % blockSize)
+	padText := bytes.Repeat([]byte{byte(padding)}, padding)
+	return append(data, padText...)
+}
+
+func removePKCS7Padding(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, errors.New("invalid padding: data is empty")
+	}
+	padding := int(data[len(data)-1])
+	if padding < 1 || padding > 16 {
+		return nil, errors.New("invalid padding value")
+	}
+	for _, b := range data[len(data)-padding:] {
+		if b != byte(padding) {
+			return nil, errors.New("invalid padding bytes")
+		}
+	}
+	return data[:len(data)-padding], nil
 }

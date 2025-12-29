@@ -11,13 +11,17 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
-	"github.com/VABorisov/CryptoMessenger/internal/auth"
+	"github.com/VABorisov/CryptoMessenger/internal/credentialsstore"
+	"github.com/VABorisov/CryptoMessenger/internal/crypto/asymmetric"
 	"github.com/VABorisov/CryptoMessenger/internal/ui/login"
 	"github.com/VABorisov/CryptoMessenger/internal/ui/mainscreen"
 )
 
 func ShowDBSettingsWindow(a fyne.App, ctx context.Context, logger *slog.Logger) {
 	w := a.NewWindow("Credentials Store")
+	w.SetOnClosed(func() {
+		a.Quit()
+	})
 	w.Resize(fyne.NewSize(350, 150))
 	w.CenterOnScreen()
 
@@ -31,18 +35,26 @@ func ShowDBSettingsWindow(a fyne.App, ctx context.Context, logger *slog.Logger) 
 		addr := strings.TrimSpace(addrEntry.Text)
 		pass := passEntry.Text
 
-		authService, err := auth.NewRedisAuthService(ctx, logger, addr, pass)
+		authService, err := credentialsstore.NewRedisCredentialsStore(ctx, logger, addr, pass)
 		if err != nil {
 			dialog.ShowError(fmt.Errorf("connection error: %w", err), w)
 			return
 		}
-		w.Close()
+
+		w.Hide()
 		login.ShowLoginWindow(a, authService, ctx, logger)
 	})
 
-	guestBtn := widget.NewButton("Entry as Guest", func() {
-		w.Close()
-		mainscreen.ShowMainWindow(a, "Guest", false, ctx, logger)
+	guestBtn := widget.NewButton("Enter as Guest", func() {
+		rsaCipher, err := asymmetric.NewRSAAsymmetricCipher(logger, "Guest")
+		if err != nil {
+			logger.Error("failed to generate guest RSA keys", "error", err)
+			dialog.ShowError(fmt.Errorf("Failed to generate temporary keys: %w", err), w)
+			return
+		}
+
+		w.Hide()
+		mainscreen.ShowMainWindow(a, "Guest", false, ctx, logger, rsaCipher)
 	})
 
 	connectBtn.Disable()

@@ -4,8 +4,13 @@ import (
 	"context"
 	"fmt"
 	"image"
+	"io"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"log/slog"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -14,77 +19,110 @@ import (
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
 
-	"log/slog"
-
+	"github.com/VABorisov/CryptoMessenger/internal/crypto/asymmetric"
+	"github.com/VABorisov/CryptoMessenger/internal/crypto/block"
+	"github.com/VABorisov/CryptoMessenger/internal/crypto/stream"
+	"github.com/VABorisov/CryptoMessenger/internal/image/formats/ppm"
 	"github.com/VABorisov/CryptoMessenger/internal/models"
+	"github.com/VABorisov/CryptoMessenger/internal/transport"
 	"github.com/VABorisov/CryptoMessenger/internal/transport/udp"
 )
 
-type EncryptionMode string
+type (
+	Message struct {
+		Username string
+		Text     string
+		Image    fyne.CanvasObject
+		IsSent   bool
+	}
+
+	KeyExchangeState struct {
+		mu                sync.Mutex
+		username          string
+		rsaCipher         asymmetric.AsymmetricCipher
+		blockCipher       block.BlockCipher
+		streamCipher      stream.StreamCipher
+		localWantsConnect bool
+		peerWantsConnect  bool
+		connected         bool
+		isInitiator       bool
+		peerPublicKey     []byte
+		publicTicker      *time.Ticker
+		keysReceived      bool
+		pingReceived      bool
+	}
+
+	EncryptionMode string
+)
 
 const (
-	ModeBlock  EncryptionMode = "Блочный шифр (AES)"
-	ModeStream EncryptionMode = "Поточный шифр (ChaCha20)"
+	ModeBlock  EncryptionMode = "Block Cipher (TEA)"
+	ModeStream EncryptionMode = "Stream Cipher (ChaCha20)"
 )
-
-type Message struct {
-	Username string
-	Text     string
-	Image    image.Image
-	IsSent   bool
-}
 
 var (
-	udpHandler *udp.UDPHandler
-	peerAddr   string
+	udpTransport    transport.Transport
+	peerAddr        string
+	keyState        *KeyExchangeState
+	connectBtn      *widget.Button
+	currentPPMImage image.Image
+	currentPPMData  []byte
 )
 
-func ShowMainWindow(a fyne.App, username string, isAuthenticated bool, ctx context.Context, logger *slog.Logger) {
+func ShowMainWindow(a fyne.App, username string, isAuthenticated bool, ctx context.Context, logger *slog.Logger, rsaCipher asymmetric.AsymmetricCipher) {
 	w := a.NewWindow("CryptoMessenger — " + username)
-	w.Resize(fyne.NewSize(1200, 800))
+	w.SetOnClosed(func() {
+		a.Quit()
+	})
+	w.Resize(fyne.NewSize(1400, 900))
 	w.CenterOnScreen()
 
-	// Чат
+	keyState = &KeyExchangeState{
+		username:  username,
+		rsaCipher: rsaCipher,
+	}
+
 	messagesList := container.NewVBox()
 	scroll := container.NewScroll(messagesList)
 	scroll.Direction = container.ScrollVerticalOnly
 
-	// Ввод текста
 	textEntry := widget.NewMultiLineEntry()
-	textEntry.SetPlaceHolder("Введите сообщение...")
+	textEntry.SetPlaceHolder("Enter message...")
 	textEntry.Wrapping = fyne.TextWrapWord
 
-	// Шифрование
 	encryptMode := widget.NewSelect([]string{string(ModeBlock), string(ModeStream)}, nil)
 	encryptMode.SetSelected(string(ModeBlock))
 
-	// Изображение
 	var attachedImage *canvas.Image
-	var attachedImagePath string
-	imagePreview := container.NewCenter(widget.NewLabel("Изображение не прикреплено"))
+	imagePreview := container.NewCenter(widget.NewLabel("No image attached"))
 
-	attachBtn := widget.NewButton("Прикрепить изображение", func() {
+	attachBtn := widget.NewButton("Attach Image", func() {
 		if !isAuthenticated {
-			dialog.ShowInformation("Доступ запрещён", "Для отправки изображений нужно авторизоваться", w)
+			dialog.ShowInformation("Access Denied", "You need to authenticate to send images", w)
 			return
 		}
 
-		// Большой диалог выбора файла
-		fileDialog := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
+		fd := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
 			if err != nil || reader == nil {
 				return
 			}
 			defer reader.Close()
 
-			img, _, err := image.Decode(reader)
+			data, err := io.ReadAll(reader)
 			if err != nil {
-				dialog.ShowError(err, w)
+				dialog.ShowError(fmt.Errorf("Error reading file: %w", err), w)
+				return
+			}
+
+			img, err := ppm.Decode(strings.NewReader(string(data)))
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("Error decoding PPM: %w", err), w)
 				return
 			}
 
 			attachedImage = canvas.NewImageFromImage(img)
 			attachedImage.FillMode = canvas.ImageFillContain
-			attachedImage.SetMinSize(fyne.NewSize(400, 300)) // больше предпросмотр
+			attachedImage.SetMinSize(fyne.NewSize(500, 400))
 
 			imagePreview.RemoveAll()
 			imagePreview.Add(container.NewCenter(
@@ -95,30 +133,26 @@ func ShowMainWindow(a fyne.App, username string, isAuthenticated bool, ctx conte
 			))
 			imagePreview.Refresh()
 
-			attachedImagePath = reader.URI().Path()
+			currentPPMImage = img
+			currentPPMData = data
 		}, w)
 
-		// Делаем диалог большим
-		fileDialog.Resize(fyne.NewSize(1000, 650))
-
-		fileDialog.SetFilter(storage.NewExtensionFileFilter([]string{".ppm", ".jpg", ".jpeg", ".JPG", ".JPEG"}))
-		fileDialog.Show()
+		fd.Resize(fyne.NewSize(1000, 650))
+		fd.SetFilter(storage.NewExtensionFileFilter([]string{".ppm"}))
+		fd.Show()
 	})
 
-	// === UDP Настройки ===
 	localPortEntry := widget.NewEntry()
-	localPortEntry.SetPlaceHolder("Мой порт (пусто = автоматический)")
+	localPortEntry.SetPlaceHolder("My port (empty = automatic)")
 
-	setListenerBtn := widget.NewButton("Установить передатчик", nil) // временно nil, зададим ниже
+	setListenerBtn := widget.NewButton("Start Listener", nil)
 
-	// Поле собеседника
 	peerEntry := widget.NewEntry()
-	peerEntry.SetPlaceHolder("IP:порт собеседника (например, 192.168.1.100:54321)")
+	peerEntry.SetPlaceHolder("Peer IP:port (e.g., 192.168.1.100:54321)")
 
-	connectBtn := widget.NewButton("Подключиться", nil) // временно nil
+	connectBtn = widget.NewButton("Connect", nil)
 
-	// Обработчик установки передатчика
-	setListenerBtn.SetText("Установить передатчик")
+	setListenerBtn.SetText("Start Listener")
 	setListenerBtn.OnTapped = func() {
 		portStr := strings.TrimSpace(localPortEntry.Text)
 		port := 0
@@ -126,34 +160,33 @@ func ShowMainWindow(a fyne.App, username string, isAuthenticated bool, ctx conte
 			var err error
 			port, err = strconv.Atoi(portStr)
 			if err != nil || port < 1 || port > 65535 {
-				dialog.ShowError(fmt.Errorf("Неверный формат порта"), w)
+				dialog.ShowError(fmt.Errorf("Invalid port format"), w)
 				setListenerBtn.Importance = widget.DangerImportance
-				setListenerBtn.Text = "Ошибка"
+				setListenerBtn.Text = "Error"
 				setListenerBtn.Refresh()
 				return
 			}
 		}
 
 		var err error
-		udpHandler, err = udp.NewUDPHandler(logger, port)
+		udpTransport, err = udp.NewUDPTransport(logger, port)
 		if err != nil {
-			dialog.ShowError(fmt.Errorf("Не удалось запустить передатчик: %w", err), w)
+			dialog.ShowError(fmt.Errorf("Failed to start listener: %w", err), w)
 			setListenerBtn.Importance = widget.DangerImportance
-			setListenerBtn.Text = "Ошибка запуска"
+			setListenerBtn.Text = "Start Error"
 			setListenerBtn.Refresh()
 			return
 		}
 
-		dialog.ShowInformation("Успех", fmt.Sprintf("Передатчик запущен на порту %d", udpHandler.ListenPort()), w)
+		dialog.ShowInformation("Success", fmt.Sprintf("Listener started on port %d", udpTransport.ListenPort()), w)
 		setListenerBtn.Importance = widget.SuccessImportance
-		setListenerBtn.Text = "Запущено"
+		setListenerBtn.Text = "Running"
 		setListenerBtn.Disable()
 		setListenerBtn.Refresh()
 
-		go receiveMessages(w, messagesList, scroll)
+		go receiveMessages(logger, messagesList, scroll)
 	}
 
-	// Enable/disable для поля порта
 	setListenerBtn.Disable()
 	localPortEntry.OnChanged = func(s string) {
 		if strings.TrimSpace(s) != "" {
@@ -163,170 +196,644 @@ func ShowMainWindow(a fyne.App, username string, isAuthenticated bool, ctx conte
 		}
 	}
 
-	// Обработчик подключения к собеседнику
-	connectBtn.SetText("Подключиться")
 	connectBtn.OnTapped = func() {
+		keyState.mu.Lock()
+		connected := keyState.connected
+		localWantsConnect := keyState.localWantsConnect
+		currentAddr := peerAddr
+		keyState.mu.Unlock()
+
+		if connected {
+			abortConnection()
+			return
+		}
+
 		addr := strings.TrimSpace(peerEntry.Text)
-		if addr == "" {
-			dialog.ShowInformation("Ошибка", "Введите адрес собеседника", w)
+		if err := validateAddress(addr); err != nil {
+			dialog.ShowError(fmt.Errorf("Invalid address: %w", err), w)
 			return
 		}
 
-		testMsg := models.Message{Username: username}
-		if err := udpHandler.Send(addr, testMsg); err != nil {
-			dialog.ShowError(fmt.Errorf("Не удалось подключиться: %w", err), w)
-			connectBtn.Importance = widget.DangerImportance
-			connectBtn.Text = "Ошибка"
-			connectBtn.Refresh()
+		if localWantsConnect && addr != currentAddr {
+			abortConnection()
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		if localWantsConnect && addr == currentAddr {
+			abortConnection()
 			return
 		}
 
-		peerAddr = addr
-		dialog.ShowInformation("Успех", "Подключено к "+addr, w)
-		connectBtn.Importance = widget.SuccessImportance
-		connectBtn.Text = "Подключено"
-		connectBtn.Refresh()
+		keyState.mu.Lock()
+		keyState.localWantsConnect = true
+		keyState.isInitiator = true
+		keyState.mu.Unlock()
+
+		startConnection(addr)
+		updateConnectButton()
 	}
 
-	connectBtn.Disable()
-	peerEntry.OnChanged = func(s string) {
-		if strings.TrimSpace(s) != "" {
-			connectBtn.Enable()
-		} else {
-			connectBtn.Disable()
-		}
-	}
-
-	// Отправка сообщения
-	sendBtn := widget.NewButton("Отправить", func() {
+	sendBtn := widget.NewButton("Send", func() {
 		if !isAuthenticated {
-			dialog.ShowInformation("Доступ запрещён", "Для отправки сообщений нужно авторизоваться", w)
+			dialog.ShowInformation("Access Denied", "Authentication required to send messages", w)
 			return
 		}
 
-		text := textEntry.Text
-		if text == "" && attachedImagePath == "" {
-			dialog.ShowInformation("Ошибка", "Введите текст или прикрепите изображение", w)
+		text := strings.TrimSpace(textEntry.Text)
+		hasText := text != ""
+		hasImage := currentPPMImage != nil
+
+		if !hasText && !hasImage {
+			dialog.ShowInformation("Error", "Enter text or attach an image", w)
 			return
 		}
 
-		if udpHandler == nil {
-			dialog.ShowInformation("Ошибка", "Сначала установите передатчик", w)
+		if udpTransport == nil {
+			dialog.ShowInformation("Error", "Start listener first", w)
 			return
 		}
 
-		if peerAddr == "" {
-			dialog.ShowInformation("Ошибка", "Сначала подключитесь к собеседнику", w)
+		if peerAddr == "" || !keyState.connected {
+			dialog.ShowInformation("Error", "Connect to peer first", w)
+			return
+		}
+
+		selectedMode := encryptMode.Selected
+		var encryptFunc func([]byte) ([]byte, error)
+		var modeStr string
+
+		keyState.mu.Lock()
+		if selectedMode == string(ModeBlock) {
+			if keyState.blockCipher == nil {
+				keyState.mu.Unlock()
+				dialog.ShowError(fmt.Errorf("Block cipher not initialized"), w)
+				return
+			}
+			encryptFunc = keyState.blockCipher.Encrypt
+			modeStr = "tea"
+		} else {
+			if keyState.streamCipher == nil {
+				keyState.mu.Unlock()
+				dialog.ShowError(fmt.Errorf("Stream cipher not initialized"), w)
+				return
+			}
+			encryptFunc = keyState.streamCipher.Encrypt
+			modeStr = "chacha20"
+		}
+		keyState.mu.Unlock()
+
+		var dataToEncrypt []byte
+		if hasText {
+			dataToEncrypt = []byte(text)
+		}
+		if hasImage {
+			if hasText {
+				dataToEncrypt = append(dataToEncrypt, []byte("\n---CRYPTO_MESSENGER_PPM---\n")...)
+				dataToEncrypt = append(dataToEncrypt, currentPPMData...)
+			} else {
+				dataToEncrypt = currentPPMData
+			}
+		}
+
+		encrypted, err := encryptFunc(dataToEncrypt)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("Encryption error: %w", err), w)
 			return
 		}
 
 		msg := models.Message{
-			Username: username,
-			Text:     text,
-			HasImage: attachedImagePath != "",
+			Type:           models.MessageTypeRegular,
+			Username:       username,
+			EncryptedData:  encrypted,
+			HasImage:       hasImage,
+			EncryptionMode: modeStr,
 		}
 
-		if err := udpHandler.Send(peerAddr, msg); err != nil {
-			dialog.ShowError(fmt.Errorf("Ошибка отправки: %w", err), w)
+		if err := udpTransport.Send(peerAddr, msg); err != nil {
+			dialog.ShowError(fmt.Errorf("Send error: %w", err), w)
 			return
+		}
+
+		var display fyne.CanvasObject
+		if hasImage {
+			display = attachedImage
 		}
 
 		addMessage(messagesList, scroll, Message{
 			Username: username,
 			Text:     text,
-			Image:    attachedImage.Image,
+			Image:    display,
 			IsSent:   true,
 		})
 
 		textEntry.SetText("")
-		attachedImagePath = ""
+		currentPPMImage = nil
+		currentPPMData = nil
 		imagePreview.RemoveAll()
-		imagePreview.Add(widget.NewLabel("Изображение не прикреплено"))
+		imagePreview.Add(container.NewCenter(widget.NewLabel("No image attached")))
 		imagePreview.Refresh()
 	})
 
-	// Блокировка элементов, если не авторизован
 	if !isAuthenticated {
 		textEntry.Disable()
 		attachBtn.Disable()
 		sendBtn.Disable()
 		encryptMode.Disable()
-		localPortEntry.Disable()
-		setListenerBtn.Disable()
-		peerEntry.Disable()
-		connectBtn.Disable()
 	}
 
-	// Нижняя панель ввода
 	inputBox := container.NewBorder(
 		nil, nil,
-		container.NewHBox(attachBtn, widget.NewLabel("Шифрование:"), encryptMode),
+		container.NewHBox(attachBtn, widget.NewLabel("Encryption:"), encryptMode),
 		container.NewHBox(sendBtn),
 		textEntry,
 	)
 
-	// Панель UDP
 	udpBox := container.NewVBox(
-		widget.NewLabelWithStyle("UDP настройки", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		widget.NewLabelWithStyle("Connection settings", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		container.NewGridWithColumns(3,
-			widget.NewLabel("Мой порт:"),
-			container.NewMax(localPortEntry), // растягиваем поле
+			widget.NewLabel("My port:"),
+			container.NewMax(localPortEntry),
 			setListenerBtn,
 		),
 		container.NewGridWithColumns(3,
-			widget.NewLabel("Собеседник:"),
-			container.NewMax(peerEntry), // растягиваем поле
+			widget.NewLabel("Peer:"),
+			container.NewMax(peerEntry),
 			connectBtn,
 		),
 		widget.NewSeparator(),
 	)
 
-	// Основной layout
+	imageSection := container.NewVBox(
+		widget.NewLabelWithStyle("Attached image:", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		imagePreview,
+	)
+
+	imageSectionLimited := container.NewMax(container.NewBorder(nil, nil, nil, nil, imageSection))
+
+	chatSection := container.NewBorder(
+		widget.NewLabelWithStyle("Chat", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		nil, nil, nil,
+		scroll,
+	)
+
+	mainContent := container.NewHSplit(imageSectionLimited, chatSection)
+	mainContent.SetOffset(0.5)
+
 	content := container.NewBorder(
 		udpBox,
 		inputBox,
 		nil, nil,
-		container.NewVBox(
-			widget.NewLabelWithStyle("Чат", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
-			scroll,
-			widget.NewSeparator(),
-			widget.NewLabel("Прикреплённое изображение:"),
-			imagePreview,
-		),
+		mainContent,
 	)
 
 	w.SetContent(container.NewPadded(content))
 	w.SetMaster()
 
 	w.SetOnClosed(func() {
-		if udpHandler != nil {
-			udpHandler.Close()
+		if udpTransport != nil {
+			udpTransport.Close()
+		}
+		if !isAuthenticated && keyState != nil && keyState.rsaCipher != nil {
+			if err := keyState.rsaCipher.DeleteGuestKeys(); err != nil {
+				logger.Error("failed to delete guest keys", "error", err)
+			} else {
+				logger.Info("guest keys deleted successfully")
+			}
 		}
 	})
 
+	updateConnectButton()
 	w.Show()
 }
 
-func receiveMessages(w fyne.Window, list *fyne.Container, scroll *container.Scroll) {
-	for incoming := range udpHandler.ReceiveChannel() {
+func receiveMessages(logger *slog.Logger, list *fyne.Container, scroll *container.Scroll) {
+	for in := range udpTransport.ReceiveChannel() {
+		switch in.Msg.Type {
+		case models.MessageTypePublicKey:
+			handlePublicKey(logger, in.Msg, in.From)
+		case models.MessageTypeSymmetricKey:
+			handleSymmetricKey(logger, in.Msg)
+		case models.MessageTypeKeyAck:
+			handleKeyAck()
+		case models.MessagePing:
+			handlePing(logger, in.From)
+		case models.MessageTypeRegular:
+			handleRegularMessage(logger, in.Msg, list, scroll)
+		default:
+			if in.Msg.Type == "" && len(in.Msg.EncryptedData) > 0 {
+				handleRegularMessage(logger, in.Msg, list, scroll)
+			}
+		}
+	}
+}
+
+func updateConnectButton() {
+	if connectBtn == nil {
+		return
+	}
+
+	keyState.mu.Lock()
+	local := keyState.localWantsConnect
+	connected := keyState.connected
+	keyState.mu.Unlock()
+
+	fyne.Do(func() {
+		switch {
+		case connected:
+			connectBtn.SetText("Connected")
+			connectBtn.Enable()
+			connectBtn.Importance = widget.SuccessImportance
+		case local:
+			connectBtn.SetText("Connecting...")
+			connectBtn.Enable()
+			connectBtn.Importance = widget.HighImportance
+		default:
+			connectBtn.SetText("Connect")
+			connectBtn.Enable()
+			connectBtn.Importance = widget.MediumImportance
+		}
+		connectBtn.Refresh()
+	})
+}
+
+func validateAddress(addr string) error {
+	if addr == "" {
+		return fmt.Errorf("address cannot be empty")
+	}
+
+	parts := strings.Split(addr, ":")
+	if len(parts) != 2 {
+		return fmt.Errorf("address must be in format 'host:port' or 'IP:port' (e.g., 192.168.1.100:54321)")
+	}
+
+	host := strings.TrimSpace(parts[0])
+	portStr := strings.TrimSpace(parts[1])
+
+	if host == "" {
+		return fmt.Errorf("host cannot be empty")
+	}
+	if portStr == "" {
+		return fmt.Errorf("port cannot be empty")
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("port must be a number")
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535")
+	}
+
+	return nil
+}
+
+func startConnection(addr string) {
+	if addr == "" || udpTransport == nil {
+		return
+	}
+
+	peerAddr = addr
+
+	keyState.mu.Lock()
+	keyState.keysReceived = false
+	keyState.pingReceived = false
+	if keyState.publicTicker != nil {
+		keyState.publicTicker.Stop()
+		keyState.publicTicker = nil
+	}
+	keyState.mu.Unlock()
+
+	sendPublicKey(addr)
+
+	keyState.mu.Lock()
+	keyState.publicTicker = time.NewTicker(2 * time.Second)
+	keyState.mu.Unlock()
+
+	go func() {
+		ticker := keyState.publicTicker
+		if ticker == nil {
+			return
+		}
+
+		for range ticker.C {
+			keyState.mu.Lock()
+			shouldStop := keyState.connected || !keyState.localWantsConnect || !keyState.isInitiator
+			currentAddr := peerAddr
+			keyState.mu.Unlock()
+
+			if shouldStop {
+				keyState.mu.Lock()
+				if keyState.publicTicker != nil {
+					keyState.publicTicker.Stop()
+					keyState.publicTicker = nil
+				}
+				keyState.mu.Unlock()
+				return
+			}
+
+			if currentAddr != "" {
+				sendPublicKey(currentAddr)
+			}
+		}
+	}()
+}
+
+func sendPublicKey(addr string) {
+	if udpTransport == nil {
+		return
+	}
+
+	pub, err := keyState.rsaCipher.GetPublicKey()
+	if err != nil {
+		return
+	}
+
+	msg := models.Message{
+		Type:          models.MessageTypePublicKey,
+		PublicKeyData: pub,
+	}
+
+	udpTransport.Send(addr, msg)
+}
+
+func abortConnection() {
+	keyState.mu.Lock()
+	keyState.localWantsConnect = false
+	keyState.peerWantsConnect = false
+	keyState.connected = false
+	keyState.isInitiator = false
+	keyState.keysReceived = false
+	keyState.pingReceived = false
+	if keyState.publicTicker != nil {
+		keyState.publicTicker.Stop()
+		keyState.publicTicker = nil
+	}
+	keyState.mu.Unlock()
+
+	peerAddr = ""
+	updateConnectButton()
+}
+
+func handlePublicKey(logger *slog.Logger, msg models.Message, from string) {
+	keyState.mu.Lock()
+	keyState.peerWantsConnect = true
+	keyState.peerPublicKey = msg.PublicKeyData
+	if peerAddr == "" {
+		peerAddr = from
+	}
+	initiator := keyState.isInitiator && keyState.localWantsConnect
+	keyState.mu.Unlock()
+
+	if initiator {
+		keyState.mu.Lock()
+		if keyState.publicTicker != nil {
+			keyState.publicTicker.Stop()
+			keyState.publicTicker = nil
+		}
+		keyState.mu.Unlock()
+
+		if len(keyState.peerPublicKey) > 0 {
+			sendSymmetricKeys(logger)
+		}
+	} else {
+		pub, err := keyState.rsaCipher.GetPublicKey()
+		if err != nil {
+			logger.Error("failed to get public key for response", "error", err)
+			return
+		}
+
+		responseMsg := models.Message{
+			Type:          models.MessageTypePublicKey,
+			PublicKeyData: pub,
+		}
+
+		udpTransport.Send(from, responseMsg)
+	}
+}
+
+func handleSymmetricKey(logger *slog.Logger, msg models.Message) {
+	data, err := keyState.rsaCipher.Decrypt(msg.SymmetricKeyData)
+	if err != nil {
+		logger.Error("failed to decrypt symmetric keys", "error", err)
+		return
+	}
+
+	if len(data) != 72 {
+		logger.Error("invalid symmetric key data length", "got", len(data), "expected", 72)
+		return
+	}
+
+	teaKey := data[0:16]
+	chachaKey := data[16:48]
+	chachaNonce := data[48:72]
+
+	keyState.mu.Lock()
+	keyState.blockCipher = block.NewTEABlockCipherWithKey(logger, teaKey)
+	keyState.streamCipher = stream.NewChaCha20StreamCipherWithKey(logger, chachaKey, chachaNonce)
+	keyState.keysReceived = true
+	localWantsConnect := keyState.localWantsConnect
+	keyState.mu.Unlock()
+
+	udpTransport.Send(peerAddr, models.Message{Type: models.MessageTypeKeyAck})
+
+	if localWantsConnect && peerAddr != "" {
+		udpTransport.Send(peerAddr, models.Message{Type: models.MessagePing})
+	}
+
+	keyState.mu.Lock()
+	if localWantsConnect && keyState.pingReceived {
+		keyState.connected = true
+	}
+	keyState.mu.Unlock()
+
+	updateConnectButton()
+}
+
+func handleKeyAck() {
+	keyState.mu.Lock()
+	keyState.keysReceived = true
+	localWantsConnect := keyState.localWantsConnect
+	keyState.mu.Unlock()
+
+	if localWantsConnect && peerAddr != "" {
+		udpTransport.Send(peerAddr, models.Message{Type: models.MessagePing})
+	}
+
+	keyState.mu.Lock()
+	if localWantsConnect && keyState.pingReceived {
+		keyState.connected = true
+	}
+	keyState.mu.Unlock()
+
+	updateConnectButton()
+}
+
+func handlePing(logger *slog.Logger, from string) {
+	keyState.mu.Lock()
+	alreadyConnected := keyState.connected
+	localWantsConnect := keyState.localWantsConnect
+	keysReceived := keyState.keysReceived
+	keyState.mu.Unlock()
+
+	if !alreadyConnected {
+		udpTransport.Send(from, models.Message{Type: models.MessagePing})
+	}
+
+	keyState.mu.Lock()
+	keyState.pingReceived = true
+	keyState.mu.Unlock()
+
+	if localWantsConnect && keysReceived && !alreadyConnected {
+		keyState.mu.Lock()
+		keyState.connected = true
+		keyState.mu.Unlock()
+		updateConnectButton()
+	}
+}
+
+func sendSymmetricKeys(logger *slog.Logger) {
+	keyState.mu.Lock()
+	peerPubKey := keyState.peerPublicKey
+	keyState.mu.Unlock()
+
+	if len(peerPubKey) == 0 {
+		logger.Error("cannot send symmetric keys: peer public key not received")
+		return
+	}
+
+	tea := block.NewTEABlockCipher(logger)
+	chacha := stream.NewChaCha20StreamCipher(logger)
+
+	keyState.mu.Lock()
+	keyState.blockCipher = tea
+	keyState.streamCipher = chacha
+	keyState.keysReceived = true
+	keyState.mu.Unlock()
+
+	teaKey := tea.GetKey()
+	chachaKey, chachaNonce := chacha.GetKey()
+
+	payload := make([]byte, 0, 72)
+	payload = append(payload, teaKey...)
+	payload = append(payload, chachaKey...)
+	payload = append(payload, chachaNonce...)
+
+	encrypted, err := keyState.rsaCipher.EncryptWithPeerKey(peerPubKey, payload)
+	if err != nil {
+		logger.Error("failed to encrypt symmetric keys", "error", err)
+		return
+	}
+
+	msg := models.Message{
+		Type:             models.MessageTypeSymmetricKey,
+		SymmetricKeyData: encrypted,
+	}
+
+	udpTransport.Send(peerAddr, msg)
+
+	keyState.mu.Lock()
+	localWantsConnect := keyState.localWantsConnect
+	keyState.mu.Unlock()
+
+	if localWantsConnect && peerAddr != "" {
+		udpTransport.Send(peerAddr, models.Message{Type: models.MessagePing})
+	}
+}
+
+func handleRegularMessage(logger *slog.Logger, msg models.Message, list *fyne.Container, scroll *container.Scroll) {
+	if len(msg.EncryptedData) == 0 {
+		return
+	}
+
+	keyState.mu.Lock()
+	blockCipher := keyState.blockCipher
+	streamCipher := keyState.streamCipher
+	keyState.mu.Unlock()
+
+	if blockCipher == nil || streamCipher == nil {
+		logger.Warn("ciphers not ready for decryption")
+		return
+	}
+
+	var decryptFunc func([]byte) ([]byte, error)
+
+	switch msg.EncryptionMode {
+	case "tea":
+		decryptFunc = blockCipher.Decrypt
+	case "chacha20":
+		decryptFunc = streamCipher.Decrypt
+	default:
+		text := string(msg.EncryptedData)
 		fyne.Do(func() {
 			addMessage(list, scroll, Message{
-				Username: incoming.Msg.Username,
-				Text:     incoming.Msg.Text,
-				Image:    nil, // пока без изображений
+				Username: msg.Username,
+				Text:     "[Unknown encryption mode] " + text,
+				Image:    nil,
 				IsSent:   false,
 			})
 		})
+		return
 	}
+
+	decrypted, err := decryptFunc(msg.EncryptedData)
+	if err != nil {
+		logger.Error("decryption error", "error", err)
+		fyne.Do(func() {
+			addMessage(list, scroll, Message{
+				Username: msg.Username,
+				Text:     "[Decryption error]",
+				Image:    nil,
+				IsSent:   false,
+			})
+		})
+		return
+	}
+
+	var text string
+	var displayObj fyne.CanvasObject
+
+	if msg.HasImage {
+		parts := strings.SplitN(string(decrypted), "\n---CRYPTO_MESSENGER_PPM---\n", 2)
+		var ppmBytes []byte
+		if len(parts) == 2 {
+			text = strings.TrimSpace(parts[0])
+			ppmBytes = []byte(parts[1])
+		} else {
+			text = ""
+			ppmBytes = decrypted
+		}
+
+		imgDecoded, err := ppm.Decode(strings.NewReader(string(ppmBytes)))
+		if err != nil {
+			logger.Error("failed to decode received PPM", "error", err)
+			text += "\n[Image display error]"
+		} else {
+			imgObj := canvas.NewImageFromImage(imgDecoded)
+			imgObj.FillMode = canvas.ImageFillContain
+			imgObj.SetMinSize(fyne.NewSize(500, 400))
+			displayObj = imgObj
+		}
+	} else {
+		text = string(decrypted)
+	}
+
+	fyne.Do(func() {
+		addMessage(list, scroll, Message{
+			Username: msg.Username,
+			Text:     text,
+			Image:    displayObj,
+			IsSent:   false,
+		})
+	})
 }
 
 func addMessage(list *fyne.Container, scroll *container.Scroll, msg Message) {
 	bubble := container.NewVBox()
 
 	if msg.IsSent {
-		bubble.Add(widget.NewLabelWithStyle("Вы ("+msg.Username+")", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true}))
+		bubble.Add(widget.NewLabelWithStyle("You ("+msg.Username+")", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true}))
 	} else {
-		bubble.Add(widget.NewLabelWithStyle(msg.Username, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}))
+		bubble.Add(widget.NewLabelWithStyle("Peer ("+msg.Username+")", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}))
 	}
 
 	if msg.Text != "" {
@@ -334,18 +841,15 @@ func addMessage(list *fyne.Container, scroll *container.Scroll, msg Message) {
 	}
 
 	if msg.Image != nil {
-		img := canvas.NewImageFromImage(msg.Image)
-		img.FillMode = canvas.ImageFillContain
-		img.SetMinSize(fyne.NewSize(300, 200))
-		bubble.Add(img)
+		bubble.Add(msg.Image)
 	}
 
 	bubble.Add(widget.NewSeparator())
 
 	if msg.IsSent {
-		list.Add(container.NewHBox(container.NewMax(bubble)))
+		list.Add(container.NewHBox(container.NewMax(), container.NewPadded(bubble)))
 	} else {
-		list.Add(container.NewHBox(bubble))
+		list.Add(container.NewHBox(container.NewPadded(bubble), container.NewMax()))
 	}
 
 	list.Refresh()

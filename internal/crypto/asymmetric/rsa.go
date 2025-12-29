@@ -54,6 +54,25 @@ func (c *RSAAsymmetricCipher) Encrypt(data []byte) ([]byte, error) {
 	return res, nil
 }
 
+func (c *RSAAsymmetricCipher) EncryptWithPeerKey(peerKey []byte, data []byte) ([]byte, error) {
+	block, _ := pem.Decode(peerKey)
+	if block == nil {
+		return nil, errors.New("failed to decode PEM block containing public key")
+	}
+
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse public key: %w", err)
+	}
+
+	rsaPub, ok := pub.(*rsa.PublicKey)
+	if !ok {
+		return nil, errors.New("key is not an RSA public key")
+	}
+
+	return rsa.EncryptPKCS1v15(rand.Reader, rsaPub, data)
+}
+
 func (c *RSAAsymmetricCipher) Decrypt(cipher []byte) ([]byte, error) {
 	c.logger.Info("decrypting data with RSA private key", "username", c.username)
 	if c.privateKey == nil {
