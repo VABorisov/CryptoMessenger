@@ -128,7 +128,7 @@ func ShowMainWindow(a fyne.App, username string, isAuthenticated bool, ctx conte
 			imagePreview.Add(container.NewCenter(
 				container.NewVBox(
 					attachedImage,
-					widget.NewLabel("✓ "+reader.URI().Name()),
+					widget.NewLabel(reader.URI().Name()),
 				),
 			))
 			imagePreview.Refresh()
